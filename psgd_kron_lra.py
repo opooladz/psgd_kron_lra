@@ -3,435 +3,298 @@ import random
 import numpy as np
 import torch
 
-###############################################################################
-# Schedule for preconditioner update probability
 
-def precond_update_prob_schedule(
-    max_prob=1.0, min_prob=0.03, decay=0.001, flat_start=500
-):
-    """Anneal preconditioner update probability during beginning of training.
     
-    Exponential anneal with a flat start.
-    """
-    max_prob_ = torch.tensor(max_prob, dtype=torch.float32)
-    min_prob_ = torch.tensor(min_prob, dtype=torch.float32)
-    decay_ = torch.tensor(decay, dtype=torch.float32)
-    flat_start_ = torch.tensor(flat_start, dtype=torch.float32)
-
-    @torch.compile
-    def _schedule(n):
-        prob = max_prob_ * torch.exp(-decay_ * (n - flat_start_))
-        prob.clamp_(min=min_prob_, max=max_prob_)
-        return prob
-
-    return _schedule
-
-###############################################################################
-# Per–Kronecker–factor LRA initialization and effective preconditioner
-
-def _init_LRA_exprs(t, scale, max_size, min_ndim_triangular, memory_save_mode, dtype=None, rank=10):
-    """
-    For a tensor t with shape (s₁, s₂, …, sₙ), initialize for each dimension an LRA state
-    and also compute three einsum strings (exprA, exprGs, exprP) that “encode” the Kronecker product.
     
-    Each LRA state is a dict with:
-       "U": (s, rank) tensor (or zeros if a diagonal preconditioner is used)
-       "V": (s, rank) tensor (or zeros if a diagonal preconditioner is used)
-       "d": (s, 1) tensor
-    """
-    letters = string.ascii_lowercase + string.ascii_uppercase
-    dtype = dtype if dtype is not None else t.dtype
-    shape = t.shape
-    n = len(shape)
-    if n == 0:
-        LRA_state = [{"U": None, "V": None, "d": scale * torch.ones_like(t, dtype=dtype)}]
-        exprA = ",->"
-        exprGs = [",->"]
-        exprP = ",,->"
-    else:
-        # Distribute scale equally among factors.
-        scale_factor = scale ** (1 / n)
-        # Decide which factors use a diagonal preconditioner.
-        if memory_save_mode is None:
-            dim_diag = [False for _ in shape]
-        elif memory_save_mode == "one_diag":
-            rev_sorted = np.argsort(shape)[::-1]
-            dim_diag = [False for _ in shape]
-            dim_diag[rev_sorted[0]] = True
-        elif memory_save_mode == "all_diag":
-            dim_diag = [True for _ in shape]
-        else:
-            dim_diag = [False for _ in shape]
-
-        LRA_state = []
-        # For constructing einsum strings.
-        piece1A, piece2A, piece3A = ([], "", "")
-        exprGs = []
-        piece1P, piece2P, piece3P, piece4P = ([], [], "", "")
-        for i, (size, diag_flag) in enumerate(zip(shape, dim_diag)):
-            if size == 1 or size > max_size or n < min_ndim_triangular or diag_flag:
-                # Use a diagonal preconditioner: U and V are zeros.
-                U = torch.zeros(size, rank, dtype=dtype, device=t.device)
-                V = torch.zeros(size, rank, dtype=dtype, device=t.device)
-                d = scale_factor * torch.ones(size, 1, dtype=dtype, device=t.device)
-                LRA_state.append({"U": U, "V": V, "d": d})
-                piece1A.append(letters[i])
-                piece2A += letters[i]
-                piece3A += letters[i]
-                piece1 = "".join([(letters[i + n] if j == i else letters[j]) for j in range(n)])
-                exprGs.append(piece1 + "," + piece1 + "->" + letters[i + n])
-                piece1P.append(letters[i + n])
-                piece2P.append(letters[i + n])
-                piece3P += letters[i + n]
-                piece4P += letters[i + n]
-            else:
-                # Use full triangular factors.
-                U = torch.randn(size, rank, dtype=dtype, device=t.device) / np.sqrt(size * (rank + 10))
-                V = torch.randn(size, rank, dtype=dtype, device=t.device) / np.sqrt(size * (rank + 10))
-                d = scale_factor * torch.ones(size, 1, dtype=dtype, device=t.device)
-                LRA_state.append({"U": U, "V": V, "d": d})
-                piece1A.append(letters[i] + letters[i + n])
-                piece2A += letters[i + n]
-                piece3A += letters[i]
-                piece1 = "".join([(letters[i + n] if j == i else letters[j]) for j in range(n)])
-                piece2 = "".join([(letters[i + 2 * n] if j == i else letters[j]) for j in range(n)])
-                exprGs.append(piece1 + "," + piece2 + "->" + letters[i + n])
-                a, b, c = letters[i], letters[i + n], letters[i + 2 * n]
-                piece1P.append(a + b)
-                piece2P.append(a + c)
-                piece3P += c
-                piece4P += b
-        exprA = ",".join(piece1A) + "," + piece2A + "->" + piece3A
-        exprP = ",".join(piece1P) + "," + ",".join(piece2P) + "," + piece3P + "->" + piece4P
-    exprGs = tuple(exprGs)
-    return LRA_state, (exprA, exprGs, exprP)
-
-def effective_Q(state):
-    """
-    Given a single LRA state (for one factor), return the effective preconditioner matrix:
-         Q_eff = diagflat(d) + U * V^T
-    If U and V are None (i.e. a diagonal preconditioner), this returns diagflat(d).
-    """
-    if state["U"] is None or state["V"] is None:
-        return torch.diagflat(state["d"].flatten())
-    else:
-        return torch.diagflat(state["d"].flatten()) + state["U"].mm(state["V"].t())
-
-###############################################################################
-# LRA update math (whitening; always using 2nd–order normalization)
-
-def damped_pair_vg(g, damp=2**(-13)):
-    """Return (v, g_damped) for gradient vector g."""
-    v = torch.randn_like(g)
-    return v, g + damp * torch.mean(torch.abs(g)) * v
-
 def IpUVtmatvec(U, V, x):
-    """Compute (I + U*V^T) * x."""
+    """
+    Returns (I + U * Vᵀ) * x.
+    All variables are assumed to be either matrices or column vectors.
+    """   
     return x + U.mm(V.t().mm(x))
 
 def update_precond_UVd_math_(U, V, d, v, h, step, tiny):
     """
-    Update preconditioner Q = (I + U*V^T)*diag(d) with a (v, h) pair,
-    using 2nd–order normalization. In the Kron setting, h (and thus nablaD)
-    may be a full square matrix. In that case, we update d only along its diagonal.
-
-    Assumes d is either a 1D tensor of shape (s,) or a column vector of shape (s,1).
-    """
-    # Ensure v and h are 2D.
-    if h.dim() == 1:
-        h = h.unsqueeze(1)
-    if v.dim() == 1:
-        v = v.unsqueeze(1)
+    Update the low-rank preconditioner Q = (I + U * Vᵀ) * diag(d) using the pair (v, h)
+    where h approximates the Hessian-vector product.
     
-    # Occasionally balance U and V.
+    The state variables U, V, and d are updated in-place.
+    All arguments (U, V, d, v, h) are either matrices or column vectors.
+    """
+    # Optional balancing of U and V
     if torch.rand([]) < 0.01:
         normU = torch.linalg.vector_norm(U)
         normV = torch.linalg.vector_norm(V)
-        rho = torch.sqrt((normU / normV) + tiny)
+        rho = torch.sqrt(normU / normV)
         U.div_(rho)
         V.mul_(rho)
+
+    Qh = IpUVtmatvec(U, V, d * h)
+    Ph = d * IpUVtmatvec(V, U, Qh)
     
-    # Ensure d is used as a column vector.
-    d_col = d if d.dim() == 2 else d.unsqueeze(1)
-    
-    Qh = IpUVtmatvec(U, V, d_col * h)
-    Ph = d_col * IpUVtmatvec(V, U, Qh)
-    
+    # Solve for invQtv and invPv using LU factorization
     VtU = V.t().mm(U)
     I = torch.eye(VtU.size(0), dtype=VtU.dtype, device=VtU.device)
     IpVtU = I + VtU
-    
-    invQtv = v / d_col
+    invQtv = v / d
     LU, pivots = torch.linalg.lu_factor(IpVtU)
     invQtv = invQtv - V.mm(torch.linalg.lu_solve(LU, pivots, U.t().mm(invQtv), adjoint=True))
-    invPv = invQtv - U.mm(torch.linalg.lu_solve(LU, pivots, V.t().mm(invQtv)))
-    invPv = invPv / d_col
-    
+    invPv  = invQtv - U.mm(torch.linalg.lu_solve(LU, pivots, V.t().mm(invQtv)))
+    invPv = invPv / d
+
+    # Compute the gradient for updating d
     nablaD = Ph * h - v * invPv
-    mu = step * torch.min(torch.rsqrt(Ph*Ph + v*v + tiny) *
-                            torch.rsqrt(h*h + invPv*invPv + tiny))
-    
-    # Instead of updating d with the full nablaD (which would broadcast d to shape [s,s]),
-    # we update d only along its diagonal.
-    nablaD_diag = torch.diag(nablaD)  # shape: (s,)
-    d_update = mu * d_col.squeeze() * nablaD_diag  # update: shape (s,)
-    if d.dim() == 2:
-        d.sub_(d_update.unsqueeze(1))
-    else:
-        d.sub_(d_update)
-    
-    # Update U and V with a symmetric randomized choice.
+    mu = step * torch.min(torch.rsqrt(Ph * Ph + v * v + tiny) *
+                            torch.rsqrt(h * h + invPv * invPv + tiny))
+
+    # Randomly update either U or V (but not both simultaneously)
     a, b = Qh, invQtv
     if torch.rand([]) < 0.5:
         atV = a.t().mm(V)
         btV = b.t().mm(V)
         atVVt = atV.mm(V.t())
         btVVt = btV.mm(V.t())
-        mu2 = step / (torch.linalg.vector_norm(a) * torch.linalg.vector_norm(atVVt) +
-                      torch.linalg.vector_norm(b) * torch.linalg.vector_norm(btVVt) + tiny)
-        U.sub_(mu2 * (a.mm(atV.mm(IpVtU)) - b.mm(btV.mm(IpVtU))))
+        mu = step / (torch.linalg.vector_norm(a) * torch.linalg.vector_norm(atVVt) +
+                        torch.linalg.vector_norm(b) * torch.linalg.vector_norm(btVVt) + tiny)
+
+        U.sub_(mu * (a.mm(atV.mm(IpVtU)) - b.mm(btV.mm(IpVtU))))
     else:
         atU = a.t().mm(U)
         btU = b.t().mm(U)
         UUta = U.mm(atU.t())
         UUtb = U.mm(btU.t())
-        mu2 = step / (torch.linalg.vector_norm(a) * torch.linalg.vector_norm(UUta) +
-                      torch.linalg.vector_norm(b) * torch.linalg.vector_norm(UUtb) + tiny)
-        V.sub_(mu2 * ((a + V.mm(atU.t())).mm(atU) - (b + V.mm(btU.t())).mm(btU)))
+        mu = step / (torch.linalg.vector_norm(a) * torch.linalg.vector_norm(UUta) +
+                        torch.linalg.vector_norm(b) * torch.linalg.vector_norm(UUtb) + tiny)
+
+        V.sub_(mu * ((a + V.mm(atU.t())).mm(atU) - (b + V.mm(btU.t())).mm(btU)))
 
 def precond_grad_UVd_math(U, V, d, g):
     """
-    Precondition gradient g using the LRA state:
-         pre_grad = d * (I + V*U^T) (d*g + U*(V^T*(d*g)))
-    (This is equivalent to applying Q = diag(d) + U*V^T on g twice.)
+    Precondition the gradient g with Q = (I + U * Vᵀ) * diag(d).
+    All variables are assumed to be either matrices or column vectors.
     """
-    tmp = IpUVtmatvec(U, V, d * g)
-    return d * IpUVtmatvec(V, U, tmp)
+    g = IpUVtmatvec(U, V, d * g)
+    g = d * IpUVtmatvec(V, U, g)
+    return g
 
-###############################################################################
-# Functions similar to those in the original Kron code
+def damped_pair_vg(g, damp=2**(-13)):
+    """
+    Instead of return (v, g), it returns pair
+        (v, g + sqrt(eps)*mean(abs(g))*v)
+    such that the covariance matrix of the modified g is lower bound by
+        eps * (mean(abs(g)))**2 * I
+    This should damp the preconditioner to encourage numerical stability.
+    The default amount of damping is 2**(-13), slightly smaller than sqrt(eps('single')). 
+    
+    If v is integrated out, let's just use the modified g; 
+    If hvp is used, recommend to use L2 regularization to lower bound the Hessian, although this method also works. 
 
-@torch.compile
+    Please check example
+        https://github.com/lixilinx/psgd_torch/blob/master/misc/psgd_with_finite_precision_arithmetic.py
+    for the rationale to set default damping level to 2**(-13). 
+    """
+    v = torch.randn_like(g)
+    return (v, g + damp*torch.mean(torch.abs(g))*v)
+
+
+
+import torch
+import torch.nn as nn
+from torch.optim import Optimizer
+
+def group_model_params(model: nn.Module):
+    """
+    Groups parameters of a model so that for each module, its weight and bias
+    are placed together in one parameter group.
+    
+    Args:
+        model (nn.Module): The model whose parameters are to be grouped.
+        
+    Returns:
+        List[Dict]: A list of parameter groups (each a dict with a "params" key).
+    """
+    groups = []
+    seen = set()  # to avoid duplication if parameters are shared
+    for module_name, module in model.named_modules():
+        group = []
+        if hasattr(module, 'weight') and module.weight is not None:
+            if id(module.weight) not in seen:
+                group.append(module.weight)
+                seen.add(id(module.weight))
+        if hasattr(module, 'bias') and module.bias is not None:
+            if id(module.bias) not in seen:
+                group.append(module.bias)
+                seen.add(id(module.bias))
+        if group:
+            groups.append({'params': group})
+    
+    # Some parameters (if any) might not be captured by the module iteration.
+    all_params = list(model.parameters())
+    leftover = [p for p in all_params if id(p) not in seen]
+    if leftover:
+        groups.append({'params': leftover})
+    
+    return groups
+
+
 def _balance_Q(Q_in):
     norms = torch.stack([q.norm(float("inf")) for q in Q_in])
     geometric_mean = norms.log().mean().exp()
     norms = geometric_mean / norms
     torch._foreach_mul_(Q_in, list(norms))
 
-def _lb(A: torch.Tensor, max_abs: torch.Tensor):
-    """Cheap lower bound for the spectral norm of A."""
-    A /= max_abs
-    a0 = torch.einsum("ij,ij->j", A, A)
-    i = torch.argmax(a0)
-    x = torch.index_select(A, 1, i).flatten().contiguous()
-    x = torch.einsum("i,ij->j", x, A)
-    x /= x.norm()
-    x = torch.einsum("j,kj->k", x, A)
-    x = x.norm()
-    x *= max_abs
-    return x
 
-@torch.compile
-def _solve_triangular_right(X: torch.Tensor, A: torch.Tensor):
-    """Compute X @ inv(A)."""
-    orig_dtype = A.dtype
-    return (
-        torch.linalg.solve_triangular(
-            A.float(),
-            X.reshape(-1, X.size(-1)).float(),
-            upper=True,
-            left=False,
-            unitriangular=False,
-        )
-        .to(dtype=orig_dtype)
-        .reshape_as(X)
-    )
-
-@torch.compile
-def _calc_A_and_conjB(exprA, G, Q_list):
-    """
-    Calculate A and a conjugate term (conjB) using the einsum expression exprA,
-    given effective preconditioners Q_list (one per factor) and gradient G.
-    """
-    order = G.dim()
-    V_rand = torch.randn_like(G)
-    eps = torch.tensor(torch.finfo(torch.float32).eps, dtype=G.dtype, device=G.device)
-    G = G + eps.sqrt() * G.abs().mean() * V_rand
-    conjB = V_rand.permute(*list(range(1, order)) + [0])
-    for i, q in enumerate(Q_list):
-        if q.dim() < 2:
-            conjB = conjB / q
-        else:
-            conjB = _solve_triangular_right(conjB, q)
-        if i < order - 1:
-            conjB = torch.transpose(conjB, i, order - 1)
-    A = torch.einsum(exprA, *Q_list, G)
-    return A, conjB
-
-@torch.compile
-def _update_precond_LRA(LRA_state, exprs, G, step, tiny):
-    """
-    Update each factor’s LRA state given the gradient G.
-    
-    LRA_state is a list (one per factor), and exprs is a tuple (exprA, exprGs, exprP).
-    For each factor i, we compute:
-       update_vec = einsum(exprGs[i], A, A) - einsum(exprGs[i], conjB, conjB)
-    and then update the i-th LRA state via update_precond_UVd_math_.
-    """
-    exprA, exprGs, _ = exprs
-    # Compute effective Q for each factor.
-    Q_list = [effective_Q(s) for s in LRA_state]
-    A, conjB = _calc_A_and_conjB(exprA, G, Q_list)
-    for i, exprG in enumerate(exprGs):
-        term1 = torch.einsum(exprG, A, A)
-        term2 = torch.einsum(exprG, conjB, conjB)
-        update_vec = term1 - term2
-        # Update the i-th factor’s LRA state.
-        state_i = LRA_state[i]
-        v_damp, h_damp = damped_pair_vg(update_vec)
-        update_precond_UVd_math_(state_i["U"], state_i["V"], state_i["d"],
-                                 v_damp, h_damp, step, tiny)
-
-@torch.compile
-def _precond_grad(exprP, LRA_state, G):
-    """
-    Precondition the gradient G using the effective preconditioners from each factor.
-    """
-    Q_list = [effective_Q(s) for s in LRA_state]
-    return torch.einsum(exprP, *Q_list, *Q_list, G)
-
-@torch.compile
 def _clip_update_rms(g):
     g.mul_(
         torch.minimum(
             torch.tensor(1.0, dtype=g.dtype, device=g.device),
-            1.1 / (g.square().mean().sqrt().add(1e-12)),
+            1.1 / g.square().mean().sqrt().add(1e-12),
         )
     )
 
-###############################################################################
-# KronLRA Optimizer
-
-class KronLRA(torch.optim.Optimizer):
-    """
-    Implements a Kroncker–factorized PSGD optimizer where the preconditioner
-    for each parameter is built as a Kronecker product over its dimensions.
-    For each factor (dimension) we use a low–rank approximation (LRA) update
-    (whitening style, always using 2nd–order normalization).
+class LRAOptimizer(Optimizer):
+    r"""Localized LRA preconditioning optimizer.
     
-    The overall preconditioning is computed via:
-       pre_grad = einsum(exprP, *[effective_Q(s) for s in LRA_state], *[effective_Q(s) for s in LRA_state], G)
-    where G is the debiased momentum.
+    If a model (nn.Module) is passed, its parameters are automatically grouped so that
+    a module’s weight and bias (if present) are preconditioned together.
+    
+    The preconditioner is of the form:
+    
+        Q = (I + U * Vᵀ) * diag(d)
+    
+    and is updated based on second-order (whitening) derivative information.
+    
+    Args:
+        params (iterable or nn.Module): Either an iterable of parameters (or parameter groups)
+            or a full nn.Module. In the latter case, parameters are grouped by module (weight and bias together).
+        rank (int, optional): Rank of the approximation (max rank of U or V). Default: 10.
+        preconditioner_init_scale (float, optional): Initial scale for the diagonal component d.
+            If None, d is set dynamically. Default: None.
+        lr (float, optional): Learning rate for the parameters. Default: 0.01.
+        lr_preconditioner (float, optional): Learning rate for the preconditioner update. Default: 0.1.
+        momentum (float, optional): Momentum factor in [0, 1). Default: 0.
+        grad_clip_max_norm (float, optional): Maximum norm for gradient clipping. Default: None.
+        preconditioner_update_probability (float, optional): Probability of updating the preconditioner
+            at each step. Default: 1.0.
     """
-    def __init__(
-        self,
-        params,
-        lr=0.0003,
-        b1=0.9,
-        weight_decay=0.0,
-        preconditioner_update_probability=None,
-        max_size_triangular=8192,
-        min_ndim_triangular=2,
-        memory_save_mode=None,
-        momentum_into_precond_update=True,
-        precond_lr=0.1,
-        precond_init_scale=1.0,
-        rank_LRA=10,
-        mu_dtype=None,
-        precond_dtype=None,
-    ):
-        if preconditioner_update_probability is None:
-            preconditioner_update_probability = precond_update_prob_schedule()
-        defaults = dict(
-            lr=lr,
-            b1=b1,
-            weight_decay=weight_decay,
-            preconditioner_update_probability=preconditioner_update_probability,
-            max_size_triangular=max_size_triangular,
-            min_ndim_triangular=min_ndim_triangular,
-            memory_save_mode=memory_save_mode,
-            momentum_into_precond_update=momentum_into_precond_update,
-            precond_lr=precond_lr,
-            precond_init_scale=precond_init_scale,
-            rank_LRA=rank_LRA,
-            mu_dtype=mu_dtype,
-            precond_dtype=precond_dtype,
-        )
-        super(KronLRA, self).__init__(params, defaults)
-        self._prob_step = torch.tensor(0, dtype=torch.int32)
-        self._update_counter = torch.tensor(0, dtype=torch.int32)
-        self.rng = random.Random(42)
+    def __init__(self, params, rank=10, preconditioner_init_scale=None,
+                 lr=0.01, lr_preconditioner=0.1, momentum=0.0,
+                 grad_clip_max_norm=None, preconditioner_update_probability=1.0):
+        # If a full model is passed, group its parameters by module.
+        if isinstance(params, nn.Module):
+            params = group_model_params(params)
+        
+        defaults = dict(lr=lr,
+                        lr_preconditioner=lr_preconditioner,
+                        momentum=momentum,
+                        grad_clip_max_norm=grad_clip_max_norm,
+                        preconditioner_update_probability=preconditioner_update_probability)
+        super(LRAOptimizer, self).__init__(params, defaults)
+        self.rank = rank
+        self.preconditioner_init_scale = preconditioner_init_scale
+        # A tiny constant for numerical stability.
+        self.tiny = torch.finfo(torch.float32).tiny
 
-    @torch.no_grad()
     def step(self, closure=None):
+        """
+        Performs a single optimization step.
+        
+        For each parameter group, the gradients of all parameters in that group are
+        flattened and concatenated into a single vector. A local LRA preconditioner
+        (with state U, V, d, and momentum m) is then updated using a damped pair of gradient
+        information (via external functions `damped_pair_vg` and `update_precond_UVd_math_`).
+        The preconditioned gradient is computed (optionally with momentum and gradient clipping)
+        and then used to update the parameters.
+        
+        Args:
+            closure (callable, optional): A closure that reevaluates the model and returns the loss.
+            
+        Returns:
+            The loss value evaluated after the update, if closure is provided.
+        """
         loss = None
         if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
+            loss = closure()
 
         for group in self.param_groups:
-            mu_dtype = group.get("mu_dtype")
-            precond_dtype = group.get("precond_dtype", torch.float32)
-            if precond_dtype is None:
-                precond_dtype = torch.float32
-            momentum_into_precond_update = group.get("momentum_into_precond_update", True)
-            precond_lr = torch.tensor(group["precond_lr"], dtype=precond_dtype)
-            tiny_tensor = torch.tensor(torch.finfo(precond_dtype).tiny, dtype=precond_dtype)
-
-            # Determine update probability (if callable, use current step)
-            update_prob = group["preconditioner_update_probability"]
-            if callable(update_prob):
-                update_prob = update_prob(self._prob_step.to(dtype=torch.float32))
-            self._update_counter += 1
-            do_update = self._update_counter >= 1 / update_prob
-            if do_update:
-                self._update_counter = torch.tensor(0, dtype=torch.int32)
-            self._prob_step += 1
-
-            # Optionally balance preconditioners roughly every 100 updates.
-            balance = self.rng.random() < 0.01 and do_update
+            # Accumulate gradients and related information for this group.
+            grad_list = []
+            params = []
+            shapes = []
 
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                grad = p.grad
-                state = self.state[p]
+                grad_list.append(p.grad.view(-1, 1))
+                params.append(p)
+                shapes.append(p.shape)
 
-                if len(state) == 0:
-                    state["step"] = 0
-                    state["momentum_buffer"] = torch.zeros_like(p, dtype=mu_dtype or p.dtype)
-                    # Initialize per–Kronecker–factor LRA state and einsum expressions.
-                    state["LRA"], state["exprs"] = _init_LRA_exprs(
-                        p,
-                        group["precond_init_scale"],
-                        group["max_size_triangular"],
-                        group["min_ndim_triangular"],
-                        group["memory_save_mode"],
-                        dtype=precond_dtype,
-                        rank=group["rank_LRA"],
-                    )
-                state["step"] += 1
-                beta = group["b1"]
-                momentum_buffer = state["momentum_buffer"]
-                momentum_buffer.mul_(beta).add_(grad, alpha=1 - beta)
-                if mu_dtype is not None:
-                    momentum_buffer.copy_(momentum_buffer.to(dtype=mu_dtype))
-                debiased_momentum = momentum_buffer / (1 - beta ** state["step"])
-                debiased_momentum = debiased_momentum.to(dtype=precond_dtype)
+            if not grad_list:
+                continue
 
-                if p.dim() > 1 and balance:
-                    _balance_Q([effective_Q(s) for s in state["LRA"]])
+            # Concatenate the gradients into a single column vector.
+            grad_vec = torch.cat(grad_list, dim=0)
 
-                # Update the per–factor preconditioners.
-                if do_update:
-                    # Use momentum into precond update if requested.
-                    grad_for_precond = debiased_momentum if momentum_into_precond_update else grad.to(dtype=precond_dtype)
-                    _update_precond_LRA(state["LRA"], state["exprs"], grad_for_precond, precond_lr, tiny_tensor)
+            # Use (or initialize) a local preconditioner for this group.
+            if ("precond_state" not in group) or (torch.rand(1).item() < group["preconditioner_update_probability"]):
+                if "precond_state" not in group:
+                    total_size = grad_vec.shape[0]
+                    device, dtype = grad_vec.device, grad_vec.dtype
+                    scaling = (total_size * (self.rank + 10)) ** 0.5
+                    U = torch.randn(total_size, self.rank, dtype=dtype, device=device) / scaling
+                    V = torch.randn(total_size, self.rank, dtype=dtype, device=device) / scaling
+                    d = (torch.ones(total_size, 1, dtype=dtype, device=device) * self.preconditioner_init_scale
+                         if self.preconditioner_init_scale is not None else None)
+                    precond_state = {"U": U, "V": V, "d": d, "m": None}
+                    group["precond_state"] = precond_state
+                else:
+                    precond_state = group["precond_state"]
 
-                # Precondition the gradient.
-                pre_grad = _precond_grad(state["exprs"][-1], state["LRA"], debiased_momentum)
-                _clip_update_rms(pre_grad)
-                if group["weight_decay"] != 0 and p.dim() >= 2:
-                    pre_grad.add_(p, alpha=group["weight_decay"])
-                p.add_(pre_grad.to(dtype=p.dtype), alpha=-group["lr"])
+                if precond_state["d"] is None:
+                    precond_state["d"] = (torch.mean(grad_vec ** 4)) ** (-1 / 8) * torch.ones_like(grad_vec)
+                # Compute a damped pair from the gradient.
+                # (Assume `damped_pair_vg` is defined elsewhere.)
+                v_damped, g_damped = damped_pair_vg(grad_vec)
+                # Update the preconditioner.
+                # (Assume `update_precond_UVd_math_` is defined elsewhere.)
+                update_precond_UVd_math_(precond_state["U"], precond_state["V"],
+                                         precond_state["d"],
+                                         v_damped, g_damped,
+                                         group["lr_preconditioner"], self.tiny)
+            else:
+                precond_state = group["precond_state"]
+
+            # Precondition the gradient (with optional momentum).
+            if group["momentum"] > 0:
+                if precond_state["m"] is None:
+                    precond_state["m"] = (1 - group["momentum"]) * grad_vec
+                else:
+                    precond_state["m"].mul_(group["momentum"]).add_(grad_vec, alpha=1 - group["momentum"])
+                pre_grad = precond_grad_UVd_math(precond_state["U"], precond_state["V"],
+                                                 precond_state["d"], precond_state["m"])
+            else:
+                precond_state["m"] = None
+                pre_grad = precond_grad_UVd_math(precond_state["U"], precond_state["V"],
+                                                 precond_state["d"], grad_vec)
+
+            # # Apply gradient clipping if necessary.
+            # if group["grad_clip_max_norm"] is None:
+            #     effective_lr = group["lr"]
+            # else:
+            #     grad_norm = pre_grad.norm() + self.tiny
+            #     effective_lr = group["lr"] * min(group["grad_clip_max_norm"] / grad_norm, 1.0)
+
+            # clip update RMS
+            # _clip_update_rms(pre_grad)
+
+            delta = group["lr"] * pre_grad
+
+            # Update the parameters by slicing delta according to each parameter's size.
+            start_idx = 0
+            for p, shape in zip(params, shapes):
+                numel = p.numel()
+                p_delta = delta[start_idx: start_idx + numel].view(shape)
+                p.data.sub_(p_delta)
+                start_idx += numel
+
         return loss
