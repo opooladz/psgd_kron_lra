@@ -17,3 +17,11 @@ We have also developed XMat (cross diagonal approx to Hessian or whitening (ggT)
 ![image](https://github.com/user-attachments/assets/f5142b1e-0fe3-415b-92ad-0349cae8fe94)
 
 The point is there are so many preconds. 
+
+# TODO
+ - Integrate balance Q
+ - Add precond update schedule
+ - verify everyhing
+ - add option for shared precond
+ - add option for one sided
+ - add option for shared one sided and indpendent other sided...
